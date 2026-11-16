@@ -144,6 +144,116 @@ def _rejected_keys(conn, handover_id: int) -> list[str]:
     return [r["biz_key"] for r in rows]
 
 
+def _transferred_keys(conn, handover_id: int, to_shift_id: int) -> list[str]:
+    """过户成功键：清单内、已归接班方、且不在拒收集合内（与分桶计数同源 SQL）。"""
+    rows = conn.execute(
+        """
+        SELECT b.biz_key
+        FROM handover_items hi
+        JOIN batches b ON b.id = hi.batch_id
+        WHERE hi.handover_id = ?
+          AND b.owner_shift_id = ?
+          AND hi.batch_id NOT IN (
+              SELECT batch_id FROM handover_rejections WHERE handover_id = ?
+          )
+        ORDER BY b.biz_key
+        """,
+        (handover_id, to_shift_id, handover_id),
+    ).fetchall()
+    return [r["biz_key"] for r in rows]
+
+
+def _manifest_inflight_count(conn, handover_id: int, shift_id: int) -> int:
+    return conn.execute(
+        """
+        SELECT COUNT(*) AS c
+        FROM handover_items hi
+        JOIN batches b ON b.id = hi.batch_id
+        WHERE hi.handover_id = ? AND b.owner_shift_id = ? AND b.status = '在途'
+        """,
+        (handover_id, shift_id),
+    ).fetchone()["c"]
+
+
+def _bucket_proof(conn, handover_id: int, h) -> dict:
+    """分桶证明：纳入/拒收/过户三集合与两侧在途计数，全部同源 SQL 派生。"""
+    included = _manifest_keys(conn, handover_id)
+    rejected = _rejected_keys(conn, handover_id)
+    transferred = _transferred_keys(conn, handover_id, h["to_shift_id"])
+    inc_set, rej_set, tr_set = set(included), set(rejected), set(transferred)
+    return {
+        "交班单": handover_id,
+        "交班方": h["from_shift_id"],
+        "接班方": h["to_shift_id"],
+        "纳入键": included,
+        "拒收键": rejected,
+        "过户键": transferred,
+        "纳入数": len(included),
+        "拒收数": len(rejected),
+        "过户数": len(transferred),
+        "交班方在途数": _manifest_inflight_count(conn, handover_id, h["from_shift_id"]),
+        "接班方在途数": _manifest_inflight_count(conn, handover_id, h["to_shift_id"]),
+        "两两不交": not (rej_set & tr_set),
+        "覆盖清单": tr_set | rej_set == inc_set,
+    }
+
+
+def _insert_proof(conn, handover_id: int, h, status: str, consistent: int) -> dict:
+    """每次完成/失败都落一份持久化分桶证明，按交班单 id 挂载（同单只留最新）。"""
+    proof = _bucket_proof(conn, handover_id, h)
+    conn.execute(
+        """
+        INSERT INTO handover_proofs(
+          handover_id, status, consistent, included_count, rejected_count,
+          transferred_count, from_inflight_count, to_inflight_count,
+          proof_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(handover_id) DO UPDATE SET
+          status = excluded.status,
+          consistent = excluded.consistent,
+          included_count = excluded.included_count,
+          rejected_count = excluded.rejected_count,
+          transferred_count = excluded.transferred_count,
+          from_inflight_count = excluded.from_inflight_count,
+          to_inflight_count = excluded.to_inflight_count,
+          proof_json = excluded.proof_json,
+          created_at = excluded.created_at
+        """,
+        (
+            handover_id,
+            status,
+            consistent,
+            proof["纳入数"],
+            proof["拒收数"],
+            proof["过户数"],
+            proof["交班方在途数"],
+            proof["接班方在途数"],
+            json.dumps(proof, ensure_ascii=False),
+            _now(),
+        ),
+    )
+    return proof
+
+
+def get_proof(handover_id: int) -> dict:
+    """按交班单 id 只读查询分桶证明；未完成过则 404。"""
+    with connect() as conn:
+        h = conn.execute(
+            "SELECT * FROM handovers WHERE id = ?", (handover_id,)
+        ).fetchone()
+        if not h:
+            raise HTTPException(404, "交班单不存在")
+        row = conn.execute(
+            "SELECT * FROM handover_proofs WHERE handover_id = ?", (handover_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "该交班单尚无分桶证明")
+        out = dict(row)
+        out["proof"] = json.loads(out.pop("proof_json"))
+        out["一致"] = bool(out["consistent"])
+        return out
+
+
 def get_handover(handover_id: int) -> dict:
     with connect() as conn:
         h = conn.execute(
@@ -184,6 +294,16 @@ def get_handover(handover_id: int) -> dict:
         out["items"] = rows_to_dicts(items)
         out["rejections"] = rows_to_dicts(rejections)
         out["buckets"] = _bucket_counts(conn, handover_id, h["to_shift_id"])
+        proof = conn.execute(
+            "SELECT * FROM handover_proofs WHERE handover_id = ?", (handover_id,)
+        ).fetchone()
+        if proof:
+            p = dict(proof)
+            p["proof"] = json.loads(p.pop("proof_json"))
+            p["一致"] = bool(p["consistent"])
+            out["proof"] = p
+        else:
+            out["proof"] = None
         return out
 
 
@@ -317,7 +437,7 @@ def _insert_report(conn, handover_id: int, h, consistent: int, extra: dict | Non
     buckets = _bucket_counts(conn, handover_id, h["to_shift_id"])
     detail = {
         "清单键": _manifest_keys(conn, handover_id),
-        "过户键": _manifest_keys_owned_by(conn, handover_id, h["to_shift_id"]),
+        "过户键": _transferred_keys(conn, handover_id, h["to_shift_id"]),
         "拒收键": _rejected_keys(conn, handover_id),
         "校验": "过户成功键 ∪ 拒收键 = 发起清单键，且三者两两不交",
     }
@@ -375,6 +495,8 @@ def complete_handover(handover_id: int) -> dict:
             mset, rset = set(manifest), set(rejected)
             if not rset <= mset:
                 raise HandoverInvariantError("拒收键不在发起清单键内")
+            # 完成时只过户未拒收键；拒收键必须留在交班方在途
+            transfer_ids = sorted(mset - rset)
             placeholders = ",".join("?" for _ in manifest)
             states = conn.execute(
                 f"SELECT id, owner_shift_id, status FROM batches WHERE id IN ({placeholders})",
@@ -389,7 +511,7 @@ def complete_handover(handover_id: int) -> dict:
                 raise HandoverInvariantError(
                     f"清单批次{bad}已不在交班方在途，无法整单结案"
                 )
-            for bid in sorted(mset):
+            for bid in transfer_ids:
                 conn.execute(
                     """
                     UPDATE batches SET owner_shift_id = ?
@@ -397,12 +519,16 @@ def complete_handover(handover_id: int) -> dict:
                     """,
                     (h["to_shift_id"], bid, h["from_shift_id"]),
                 )
-            transferred_keys = set(_manifest_keys_owned_by(conn, handover_id, h["to_shift_id"]))
-            stayed_keys = set(_manifest_keys_owned_by(conn, handover_id, h["from_shift_id"]))
+            transferred_keys = set(_transferred_keys(conn, handover_id, h["to_shift_id"]))
             rejected_keys = set(_rejected_keys(conn, handover_id))
             manifest_keys = set(_manifest_keys(conn, handover_id))
-            if transferred_keys | rejected_keys != manifest_keys and stayed_keys:
+            # 完成态校验固定：过户成功键 ∪ 拒收键 = 发起清单键，且两两不交
+            if transferred_keys | rejected_keys != manifest_keys:
                 raise HandoverInvariantError("过户成功键∪拒收键 ≠ 发起清单键")
+            if transferred_keys & rejected_keys:
+                raise HandoverInvariantError("过户成功键与拒收键存在交集")
+            if rejected_keys & set(_manifest_keys_owned_by(conn, handover_id, h["to_shift_id"])):
+                raise HandoverInvariantError("拒收键不得出现在接班方")
             buckets = _bucket_counts(conn, handover_id, h["to_shift_id"])
             if buckets["过户数"] + buckets["拒收数"] != buckets["清单数"]:
                 raise HandoverInvariantError("分桶计数不满足 过户数+拒收数=清单数")
@@ -413,6 +539,7 @@ def complete_handover(handover_id: int) -> dict:
             conn.execute("UPDATE shifts SET status = '已交班' WHERE id = ?", (h["from_shift_id"],))
             conn.execute("UPDATE shifts SET status = '值班中' WHERE id = ?", (h["to_shift_id"],))
             _insert_report(conn, handover_id, h, consistent=1, extra=None)
+            _insert_proof(conn, handover_id, h, status="已完成", consistent=1)
             conn.commit()
         except Exception as e:
             # 整单失败：回滚本趟所有归属变更与拒收标记，不留半截成功
@@ -426,6 +553,7 @@ def complete_handover(handover_id: int) -> dict:
             conn.execute("UPDATE shifts SET status = '值班中' WHERE id = ?", (h["from_shift_id"],))
             conn.execute("UPDATE shifts SET status = '空闲' WHERE id = ?", (h["to_shift_id"],))
             _insert_report(conn, handover_id, h, consistent=0, extra={"失败原因": reason})
+            _insert_proof(conn, handover_id, h, status="失败", consistent=0)
             conn.commit()
         finally:
             conn.isolation_level = ""

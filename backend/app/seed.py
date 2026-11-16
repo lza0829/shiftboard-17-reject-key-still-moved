@@ -55,6 +55,18 @@ CREATE TABLE IF NOT EXISTS reconcile_reports (
   detail_json TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS handover_proofs (
+  handover_id INTEGER PRIMARY KEY REFERENCES handovers(id),
+  status TEXT NOT NULL,
+  consistent INTEGER NOT NULL,
+  included_count INTEGER NOT NULL,
+  rejected_count INTEGER NOT NULL,
+  transferred_count INTEGER NOT NULL,
+  from_inflight_count INTEGER NOT NULL,
+  to_inflight_count INTEGER NOT NULL,
+  proof_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
 """
 
 

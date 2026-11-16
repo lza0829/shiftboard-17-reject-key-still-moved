@@ -93,7 +93,7 @@ async function complete() {
     const b = current.value.buckets || {}
     ok.value = current.value.status === '已完成'
     msg.value = current.value.status === '已完成'
-      ? `交班单 #${current.value.id} 已完成：清单 ${b.清单数} 键已交给接班方`
+      ? `交班单 #${current.value.id} 已完成：过户 ${b.过户数} 键、拒收 ${b.拒收数} 键，分桶证明已落库`
       : `交班单 #${current.value.id} 失败：${current.value.reason || '归属不一致'}`
     await refresh()
   } catch (e) {
@@ -145,6 +145,30 @@ async function complete() {
         <div class="bucket"><div class="k">清单数</div><div class="v">{{ current.buckets?.清单数 ?? 0 }}</div></div>
         <div class="bucket"><div class="k">过户数</div><div class="v">{{ current.buckets?.过户数 ?? 0 }}</div></div>
         <div class="bucket"><div class="k">拒收数</div><div class="v">{{ current.buckets?.拒收数 ?? 0 }}</div></div>
+      </div>
+      <div v-if="current.proof" class="panel proof">
+        <h2>
+          分桶证明
+          <span class="tag" :class="{ on: current.proof['一致'], bad: !current.proof['一致'] }">
+            {{ current.proof['一致'] ? '一致' : '不一致' }}
+          </span>
+        </h2>
+        <div class="buckets">
+          <div class="bucket"><div class="k">纳入</div><div class="v">{{ current.proof.included_count }}</div></div>
+          <div class="bucket"><div class="k">拒收</div><div class="v">{{ current.proof.rejected_count }}</div></div>
+          <div class="bucket"><div class="k">过户</div><div class="v">{{ current.proof.transferred_count }}</div></div>
+          <div class="bucket"><div class="k">交班方在途</div><div class="v">{{ current.proof.from_inflight_count }}</div></div>
+          <div class="bucket"><div class="k">接班方在途</div><div class="v">{{ current.proof.to_inflight_count }}</div></div>
+        </div>
+        <p class="lead" style="margin:0 0 8px">
+          纳入键：{{ (current.proof.proof?.纳入键 || []).join('、') || '—' }}
+        </p>
+        <p class="lead" style="margin:0 0 8px">
+          过户键：{{ (current.proof.proof?.过户键 || []).join('、') || '—' }}
+        </p>
+        <p class="lead" style="margin:0">
+          拒收键：{{ (current.proof.proof?.拒收键 || []).join('、') || '—' }}
+        </p>
       </div>
       <table>
         <thead>

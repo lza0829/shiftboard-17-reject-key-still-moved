@@ -207,6 +207,15 @@ def test_completion_failure_rolls_back(client):
     assert rep["transferred_count"] == 0
     assert rep["rejected_count"] == 1
 
+    # 失败也落一份分桶证明，证明归属已回滚（无一过户、清单键全在交班方）
+    proof = client.get(f"/api/handovers/{hid}/proof").json()
+    assert proof["一致"] is False
+    assert proof["transferred_count"] == 0
+    assert proof["rejected_count"] == 1
+    assert proof["from_inflight_count"] == len(items) - 1  # 除被外部改状态的那张
+    assert proof["to_inflight_count"] == 0
+    assert set(proof["proof"]["过户键"]) == set()
+
     # 还原外部改动，供后续用例使用
     conn = _raw()
     conn.execute("UPDATE batches SET status = '在途' WHERE id = ?", (victim_id,))
@@ -239,3 +248,65 @@ def test_reject_all_keys(client):
     assert rep["一致"] is True
     assert rep["transferred_count"] == 0
     assert rep["rejected_count"] == len(items)
+
+
+def test_proof_persisted_and_readonly(client):
+    started = _start(client, frm=2, to=3)
+    hid = started["id"]
+    items = started["items"]
+    rejected_key = items[0]["biz_key"]
+    transferred_keys = {b["biz_key"] for b in items[1:]}
+    manifest_keys = {b["biz_key"] for b in items}
+
+    # 未完成前无证明，只读接口 404
+    assert client.get(f"/api/handovers/{hid}").json()["proof"] is None
+    r = client.get(f"/api/handovers/{hid}/proof")
+    assert r.status_code == 404
+
+    r = client.put(
+        f"/api/handovers/{hid}/rejections",
+        json={"rejections": [{"batch_id": items[0]["id"], "reason": "封条破损"}]},
+    )
+    assert r.status_code == 200
+    done = client.post(f"/api/handovers/{hid}/complete")
+    assert done.json()["status"] == "已完成"
+
+    # 按交班单 id 只读查询持久化分桶证明
+    proof = client.get(f"/api/handovers/{hid}/proof")
+    assert proof.status_code == 200
+    p = proof.json()
+    assert p["handover_id"] == hid
+    assert p["included_count"] == len(manifest_keys)
+    assert p["rejected_count"] == 1
+    assert p["transferred_count"] == len(transferred_keys)
+    assert p["from_inflight_count"] == 1  # 拒收键留在交班方在途
+    assert p["to_inflight_count"] == len(transferred_keys)
+    assert set(p["proof"]["纳入键"]) == manifest_keys
+    assert set(p["proof"]["拒收键"]) == {rejected_key}
+    assert set(p["proof"]["过户键"]) == transferred_keys
+    assert p["proof"]["覆盖清单"] is True
+    assert p["proof"]["两两不交"] is True
+    assert p["一致"] is True
+
+    # 证明真实落库：绕过 API 直查 SQLite，刷新后仍在
+    conn = _raw()
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT included_count, rejected_count, transferred_count, proof_json "
+        "FROM handover_proofs WHERE handover_id = ?",
+        (hid,),
+    ).fetchone()
+    conn.close()
+    assert row is not None
+    assert (row["included_count"], row["rejected_count"], row["transferred_count"]) == (
+        len(manifest_keys), 1, len(transferred_keys)
+    )
+
+    # 交班单详情挂载同一份证明，数字与批次归属、拒收记录同源
+    detail = client.get(f"/api/handovers/{hid}").json()
+    assert detail["proof"]["included_count"] == detail["buckets"]["清单数"]
+    assert detail["proof"]["rejected_count"] == detail["buckets"]["拒收数"]
+    assert detail["proof"]["transferred_count"] == detail["buckets"]["过户数"]
+
+    # 不存在的交班单 → 404
+    assert client.get("/api/handovers/99999/proof").status_code == 404

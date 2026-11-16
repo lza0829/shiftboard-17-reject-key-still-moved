@@ -68,6 +68,27 @@ async function toggleDetail(h) {
                     分桶：清单 {{ detail.buckets.清单数 }} · 过户 {{ detail.buckets.过户数 }} · 拒收 {{ detail.buckets.拒收数 }}
                     <template v-if="detail.reason"> · 失败原因：{{ detail.reason }}</template>
                   </p>
+                  <div v-if="detail.proof" class="proof">
+                    <p class="lead" style="margin:0 0 8px">
+                      分桶证明
+                      <span class="tag" :class="{ on: detail.proof['一致'], bad: !detail.proof['一致'] }">
+                        {{ detail.proof['一致'] ? '一致' : '不一致' }}
+                      </span>
+                      · 纳入 {{ detail.proof.included_count }} · 拒收 {{ detail.proof.rejected_count }} ·
+                      过户 {{ detail.proof.transferred_count }} · 交班方在途 {{ detail.proof.from_inflight_count }} ·
+                      接班方在途 {{ detail.proof.to_inflight_count }}
+                    </p>
+                    <p class="lead" style="margin:0 0 8px">
+                      纳入键：{{ (detail.proof.proof?.纳入键 || []).join('、') || '—' }}
+                    </p>
+                    <p class="lead" style="margin:0 0 8px">
+                      过户键：{{ (detail.proof.proof?.过户键 || []).join('、') || '—' }}
+                    </p>
+                    <p class="lead" style="margin:0 0 8px">
+                      拒收键：{{ (detail.proof.proof?.拒收键 || []).join('、') || '—' }}
+                    </p>
+                  </div>
+                  <p v-else class="muted">本单尚未完成，暂无分桶证明。</p>
                   <table v-if="detail.rejections.length">
                     <thead><tr><th>业务键</th><th>标题</th><th>拒收原因</th><th>标记时间</th></tr></thead>
                     <tbody>

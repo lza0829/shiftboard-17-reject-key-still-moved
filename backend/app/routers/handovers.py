@@ -35,6 +35,12 @@ def get_rejections(handover_id: int):
     return svc.list_rejections(handover_id)
 
 
+@router.get("/{handover_id}/proof")
+def get_proof(handover_id: int):
+    """只读：按交班单 id 查询每次完成落下的持久化分桶证明。"""
+    return svc.get_proof(handover_id)
+
+
 @router.put("/{handover_id}/rejections")
 def put_rejections(handover_id: int, body: RejectionsBody):
     return svc.set_rejections(handover_id, [r.model_dump() for r in body.rejections])
